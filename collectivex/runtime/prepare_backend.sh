@@ -319,6 +319,35 @@ deepep_install() {
   [ "$(grep -c NCCL_WIN_STRICT_ORDERING "$window_cu")" = 1 ] \
     && sed -i "s/NCCL_WIN_STRICT_ORDERING/($relaxed &)/" "$window_cu" \
     || { collx_log "ERROR: DeepEP V2 window-ordering patch failed"; return 1; }
+  # PROBE (not for merge): relax the system-scope release in DeepEP's NVLink barrier.
+  "$venv/bin/python" - "$source_dir" p2 <<'PROBE_PY' >&2 || { collx_log "ERROR: probe patch failed"; return 1; }
+import sys
+root, variant = sys.argv[1], sys.argv[2]
+def edit(path, old, new):
+    text = open(path).read()
+    assert text.count(old) == 1, (path, old[:60], text.count(old))
+    open(path, "w").write(text.replace(old, new))
+ptx = root + "/deep_ep/include/deep_ep/common/ptx.cuh"
+comm = root + "/deep_ep/include/deep_ep/common/comm.cuh"
+anchor = "__forceinline__ __device__ void red_add_rel_sys(const int* ptr, const int& value) {"
+edit(ptx, anchor,
+     "__forceinline__ __device__ void red_add_relaxed_sys(const int* ptr, const int& value) {\n"
+     "    asm volatile(\"red.relaxed.sys.global.add.s32 [%0], %1;\" :: \"l\"(ptr), \"r\"(value));\n"
+     "}\n\n" + anchor)
+edit(comm,
+     "template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>\n"
+     "__forceinline__ __device__ void nvlink_barrier_wo_local_sync(",
+     "template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag, bool kRelease = true>\n"
+     "__forceinline__ __device__ void nvlink_barrier_wo_local_sync(")
+if variant == "p1":  # only barriers with no stores to flush go relaxed
+    edit(comm, "ptx::red_add_rel_sys(dst_ptr, sign ? -1 : 1);",
+         "if constexpr (kRelease) ptx::red_add_rel_sys(dst_ptr, sign ? -1 : 1); else ptx::red_add_relaxed_sys(dst_ptr, sign ? -1 : 1);")
+else:  # p2: every NVLink barrier relaxed (upper bound; drops the data-arrival guarantee)
+    edit(comm, "ptx::red_add_rel_sys(dst_ptr, sign ? -1 : 1);", "ptx::red_add_relaxed_sys(dst_ptr, sign ? -1 : 1);")
+edit(comm, "nvlink_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumTimeoutCycles, kTag>(",
+     "nvlink_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumTimeoutCycles, kTag, kFlushStores>(")
+print("probe patch applied:", variant)
+PROBE_PY
   # The RDC device-link step (nvcc -dlink) gets no -gencode from the extension build, so nvcc
   # falls back to its default arch (sm_75 on CUDA 13) and links kernels that cannot load on the
   # target GPU (gb300/sm103: cudaErrorUnknown). NVCC_PREPEND_FLAGS reaches the dlink too.
